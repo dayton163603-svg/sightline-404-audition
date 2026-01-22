@@ -1,0 +1,170 @@
+﻿// Shopify Error 404 Auditing Tool
+// Scans storefront + sitemap and outputs CSVs for broken links and redirects
+
+
+const { chromium } = require("playwright");
+const { XMLParser } = require("fast-xml-parser");
+const pLimit = require("p-limit");
+const { createObjectCsvWriter } = require("csv-writer");
+
+
+const START_URL = process.argv[2];
+const MAX_PAGES = Number(process.argv[3] || 300);
+
+
+if (!START_URL) {
+  console.error("Usage: node audit.js https://yourstore.com 300");
+  process.exit(1);
+}
+
+
+const ORIGIN = new URL(START_URL).origin;
+const HOSTNAME = new URL(START_URL).hostname;
+const limit = pLimit(8);
+
+
+const normalize = (u) => {
+  try {
+    const x = new URL(u, ORIGIN);
+    x.hash = "";
+    return x.toString();
+  } catch {
+    return null;
+  }
+};
+
+
+const isInternal = (u) => {
+  try {
+    return new URL(u, ORIGIN).hostname === HOSTNAME;
+  } catch {
+    return false;
+  }
+};
+
+
+async function fetchSitemap() {
+  try {
+    const res = await fetch(`${ORIGIN}/sitemap.xml`);
+    const xml = await res.text();
+    const parser = new XMLParser();
+    const data = parser.parse(xml);
+    const sitemaps = data.sitemapindex.sitemap.map(s => s.loc);
+    let urls = [];
+    for (const sm of sitemaps) {
+      const r = await fetch(sm);
+      const x = await r.text();
+      const d = parser.parse(x);
+      urls.push(...d.urlset.url.map(u => u.loc));
+    }
+    return urls.map(normalize).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+
+async function check(url) {
+  try {
+    const r = await fetch(url, { redirect: "manual" });
+    return r.status;
+  } catch {
+    return 0;
+  }
+}
+
+
+(async () => {
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
+
+
+  const visited = new Set();
+  const queue = [normalize(START_URL)];
+  const links = new Map();
+  const broken = [];
+
+
+  while (queue.length && visited.size < MAX_PAGES) {
+    const current = queue.shift();
+    if (!current || visited.has(current)) continue;
+    visited.add(current);
+
+
+    try {
+      const res = await page.goto(current, { waitUntil: "domcontentloaded" });
+      if (res.status() === 404) {
+        broken.push({ source: "crawl", url: current, status: 404 });
+        continue;
+      }
+
+
+      const hrefs = await page.$$eval("a[href]", as =>
+        as.map(a => a.getAttribute("href"))
+      );
+
+
+      for (const h of hrefs) {
+        const n = normalize(h);
+        if (!n || !isInternal(n)) continue;
+        if (!links.has(n)) links.set(n, new Set());
+        links.get(n).add(current);
+        if (!visited.has(n)) queue.push(n);
+      }
+    } catch {
+      broken.push({ source: "crawl", url: current, status: 0 });
+    }
+  }
+
+
+  const sitemapUrls = await fetchSitemap();
+  for (const u of sitemapUrls) {
+    if (!links.has(u)) links.set(u, new Set(["sitemap"]));
+  }
+
+
+  const results = await Promise.all(
+    [...links.keys()].map(u =>
+      limit(async () => ({ url: u, status: await check(u) }))
+    )
+  );
+
+
+  results.forEach(r => {
+    if (r.status === 404 || r.status === 0) {
+      for (const s of links.get(r.url)) {
+        broken.push({ source: s, url: r.url, status: r.status });
+      }
+    }
+  });
+
+
+  await browser.close();
+
+
+  await createObjectCsvWriter({
+    path: "broken_links.csv",
+    header: [
+      { id: "source", title: "Source Page" },
+      { id: "url", title: "Broken URL" },
+      { id: "status", title: "Status" }
+    ]
+  }).writeRecords(broken);
+
+
+  await createObjectCsvWriter({
+    path: "shopify_redirects.csv",
+    header: [
+      { id: "from", title: "Redirect from" },
+      { id: "to", title: "Redirect to" }
+    ]
+  }).writeRecords(
+    broken.map(b => ({
+      from: new URL(b.url).pathname,
+      to: "/collections/all"
+    }))
+  );
+
+
+  console.log("Audit complete.");
+})();
